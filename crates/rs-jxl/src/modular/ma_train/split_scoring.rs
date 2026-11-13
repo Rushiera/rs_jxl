@@ -313,6 +313,8 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
             (&scratch.below, &scratch.above),
             first..last,
             &[],
+            scratch.lookahead_width,
+            &mut scratch.lookahead_candidates,
         ));
     }
     let _prepare_scope = histogram_detail_scope("ma.prop_prepare");
@@ -757,6 +759,8 @@ pub(super) fn evaluate_property_values<T: PropertyValue>(
         (below_costs, above_costs),
         first..last,
         &scratch.score_mask,
+        scratch.lookahead_width,
+        &mut scratch.lookahead_candidates,
     );
     if scratch.symmetric.has_candidates() {
         let parent = &parents[plan.parent_predictor];
@@ -795,6 +799,8 @@ fn property_candidates(
     costs: (&[Cost], &[Cost]),
     range: std::ops::Range<usize>,
     score_mask: &[u8],
+    lookahead_width: usize,
+    lookahead_candidates: &mut Vec<Split>,
 ) -> Candidates {
     let (below_costs, above_costs) = costs;
     let first = range.start;
@@ -826,24 +832,25 @@ fn property_candidates(
             3
         };
         // Source penalties select predictors but are NOT part of split cost.
-        keep_better(
-            &mut result[class],
-            Split {
-                property,
-                bin,
-                below_count,
-                below_predictor: below.predictor,
-                above_predictor: above.predictor,
-                bits: below.bits + above.bits,
-                split_cost: pr5007::one_sided_cost(
-                    samples.thresholds[property][bin],
-                    options,
-                    samples.global_max_symbols,
-                    &scorer,
-                ),
-                symmetric: None,
-            },
-        );
+        let candidate = Split {
+            property,
+            bin,
+            below_count,
+            below_predictor: below.predictor,
+            above_predictor: above.predictor,
+            bits: below.bits + above.bits,
+            split_cost: pr5007::one_sided_cost(
+                samples.thresholds[property][bin],
+                options,
+                samples.global_max_symbols,
+                &scorer,
+            ),
+            symmetric: None,
+        };
+        keep_better(&mut result[class], candidate);
+        if lookahead_width != 0 {
+            super::lookahead::retain_best(lookahead_candidates, candidate, lookahead_width);
+        }
     }
     result
 }
