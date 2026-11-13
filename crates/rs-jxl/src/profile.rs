@@ -3,6 +3,9 @@
 //! RS_JXL_PROFILE=1 collects inclusive stage times; =trace additionally reports
 //! entry/exit so an interrupted process still identifies its unfinished stage.
 //! Nested and parallel totals overlap and must not be added as wall time.
+//! Parent attribution is recorded per nesting edge and reported as a separate
+//! section, so the four-column stage table stays parse-compatible.
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,47 +55,85 @@ impl Stats {
 
 const SHARDS: usize = 64;
 type Counters = BTreeMap<&'static str, Stats>;
+type EdgeKey = (&'static str, Option<&'static str>);
+type Edges = BTreeMap<EdgeKey, u64>;
 
 fn totals() -> &'static [Mutex<Counters>; SHARDS] {
     static TOTALS: OnceLock<[Mutex<Counters>; SHARDS]> = OnceLock::new();
     TOTALS.get_or_init(|| std::array::from_fn(|_| Mutex::default()))
 }
 
-fn record(name: &'static str, elapsed: Duration) {
+fn edges() -> &'static [Mutex<Edges>; SHARDS] {
+    static EDGES: OnceLock<[Mutex<Edges>; SHARDS]> = OnceLock::new();
+    EDGES.get_or_init(|| std::array::from_fn(|_| Mutex::default()))
+}
+
+thread_local! {
+    /// Live scope stack for the current thread; drives parent attribution.
+    static STACK: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+}
+
+fn slot() -> usize {
     static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
         // Bounded storage; independent workers usually avoid sharing a lock.
         static SLOT: usize = NEXT_SLOT.fetch_add(1, Ordering::Relaxed) % SHARDS;
     }
-    SLOT.with(|&slot| {
-        totals()[slot]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(name)
-            .or_default()
-            .add(elapsed);
-    });
+    SLOT.with(|&s| s)
 }
 
-fn snapshot() -> Counters {
+fn record(name: &'static str, parent: Option<&'static str>, elapsed: Duration) {
+    let slot = slot();
+    totals()[slot]
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(name)
+        .or_default()
+        .add(elapsed);
+    *edges()[slot]
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry((name, parent))
+        .or_default() += 1;
+}
+
+fn snapshot() -> (Counters, Edges) {
     let mut merged = Counters::new();
     for shard in totals() {
         for (&name, &stats) in shard.lock().unwrap_or_else(|p| p.into_inner()).iter() {
             merged.entry(name).or_default().merge(stats);
         }
     }
-    merged
+    let mut merged_edges = Edges::new();
+    for shard in edges() {
+        for (&key, &count) in shard.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            *merged_edges.entry(key).or_default() += count;
+        }
+    }
+    (merged, merged_edges)
 }
 
 #[must_use]
 pub struct Scope {
     name: &'static str,
+    parent: Option<&'static str>,
     start: Option<Instant>,
     trace: bool,
 }
 
 pub fn scope(name: &'static str) -> Scope {
     let mode = mode();
+    let active = mode != Mode::Off;
+    let parent = if active {
+        STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let parent = stack.last().copied();
+            stack.push(name);
+            parent
+        })
+    } else {
+        None
+    };
     if mode == Mode::Trace {
         eprintln!(
             "[rs-jxl profile] begin {name} {:?}",
@@ -101,7 +142,8 @@ pub fn scope(name: &'static str) -> Scope {
     }
     Scope {
         name,
-        start: (mode != Mode::Off).then(Instant::now),
+        parent,
+        start: active.then(Instant::now),
         trace: mode == Mode::Trace,
     }
 }
@@ -110,7 +152,14 @@ impl Drop for Scope {
     fn drop(&mut self) {
         let Some(start) = self.start else { return };
         let elapsed = start.elapsed();
-        record(self.name, elapsed);
+        STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            // Tolerate out-of-order drops: only pop when this scope is on top.
+            if stack.last() == Some(&self.name) {
+                stack.pop();
+            }
+        });
+        record(self.name, self.parent, elapsed);
         if self.trace {
             eprintln!(
                 "[rs-jxl profile] end {} {:.6}s {:?}",
@@ -133,7 +182,8 @@ pub fn report() -> Option<String> {
     if !enabled() {
         return None;
     }
-    let mut rows: Vec<_> = snapshot().into_iter().collect();
+    let (counters, edges) = snapshot();
+    let mut rows: Vec<_> = counters.into_iter().collect();
     rows.sort_by(|a, b| b.1.total.cmp(&a.1.total).then_with(|| a.0.cmp(b.0)));
     let mut report = String::from(
         "[rs-jxl profile] inclusive process totals; nested/parallel times overlap\n\
@@ -148,6 +198,19 @@ pub fn report() -> Option<String> {
             stats.longest.as_secs_f64()
         )
         .expect("formatting into String");
+    }
+    if !edges.is_empty() {
+        let mut edge_rows: Vec<_> = edges.into_iter().collect();
+        edge_rows.sort_by(|a, b| {
+            let parent_a = a.0.1.unwrap_or("");
+            let parent_b = b.0.1.unwrap_or("");
+            parent_a.cmp(parent_b).then_with(|| a.0.0.cmp(b.0.0))
+        });
+        report.push_str("[rs-jxl profile] parent edges (child <- parent | calls)\n");
+        for ((child, parent), calls) in edge_rows {
+            writeln!(report, "{child} <- {} | {calls}", parent.unwrap_or("(root)"))
+                .expect("formatting into String");
+        }
     }
     #[cfg(feature = "decoder-profile")]
     if let Some(backend) = jxl_decoder::decoder_profile::report() {
@@ -177,15 +240,27 @@ mod tests {
             for worker in 1..=16 {
                 scope.spawn(move || {
                     for _ in 0..1000 {
-                        record(NAME, Duration::from_micros(worker));
+                        record(NAME, None, Duration::from_micros(worker));
                     }
                 });
             }
         });
-        let stats = snapshot()[NAME];
+        let (counters, _) = snapshot();
+        let stats = counters[NAME];
         assert_eq!(stats.calls, 16000);
         assert_eq!(stats.total, Duration::from_micros(136000));
         assert_eq!(stats.longest, Duration::from_micros(16));
+    }
+
+    #[test]
+    fn parent_edges_record_nesting() {
+        record(
+            "test.profile.child",
+            Some("test.profile.parent"),
+            Duration::from_millis(1),
+        );
+        let (_, edges) = snapshot();
+        assert!(edges.contains_key(&("test.profile.child", Some("test.profile.parent"))));
     }
 
     #[test]
