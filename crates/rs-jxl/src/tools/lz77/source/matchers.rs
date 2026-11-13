@@ -424,6 +424,10 @@ pub(super) struct Chain<'a> {
     numzeros: usize,
     codes: DistanceCodes,
     cache: MatchCache,
+    /// Aggregated demand statistics (profile-only; no effect on matching).
+    pub(super) queries: u64,
+    pub(super) visits_total: u64,
+    pub(super) extensions_total: u64,
     #[cfg(test)]
     pub(super) last_visits: usize,
     #[cfg(test)]
@@ -470,6 +474,9 @@ impl<'a> Chain<'a> {
             numzeros: 0,
             codes: DistanceCodes::new(width, WINDOW_SIZE),
             cache: MatchCache::uncached(),
+            queries: 0,
+            visits_total: 0,
+            extensions_total: 0,
             #[cfg(test)]
             last_visits: 0,
             #[cfg(test)]
@@ -534,6 +541,7 @@ impl<'a> Chain<'a> {
         let mut previous_slot = self.chain[slot] as usize;
         let (mut previous_distance, mut best, mut visits) = (0usize, 0usize, 0usize);
         let limit = self.maximum.min(self.values.len() - position);
+        self.queries += 1;
         loop {
             let distance = slot.wrapping_sub(previous_slot) & (self.window - 1);
             if distance < previous_distance || distance > position.min(WINDOW_SIZE) {
@@ -580,6 +588,7 @@ impl<'a> Chain<'a> {
                     {
                         self.extensions += 1;
                     }
+                    self.extensions_total += 1;
                     length = self.cache.length_with_prefix(
                         self.values,
                         position,
@@ -625,6 +634,7 @@ impl<'a> Chain<'a> {
         {
             self.last_visits = visits;
         }
+        self.visits_total += visits as u64;
     }
 
     pub(super) fn find(&mut self, position: usize) -> Match {
@@ -1015,6 +1025,13 @@ impl<'a> Optimal<'a> {
             #[cfg(feature = "experimental-lz77")]
             chain.configure_extension(config)?;
             Ok(Self::Chain(chain))
+        }
+    }
+    /// Aggregated demand statistics for profile notes (queries / visits / extensions).
+    pub(super) fn stats(&self) -> (u64, u64, u64) {
+        match self {
+            Self::Chain(m) => (m.queries, m.visits_total, m.extensions_total),
+            Self::Buckets(_) | Self::WideBuckets(_) => (0, 0, 0),
         }
     }
     #[cfg(test)]
