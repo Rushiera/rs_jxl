@@ -7,7 +7,7 @@
 
 #[cfg(test)]
 use super::InitialCacheStage;
-use super::split_scoring::pr5007;
+use super::split_scoring::{histogram_detail_scope, pr5007};
 use super::{
     Arc, Candidates, DefaultScorer, DenseHistogram, HistogramBudget, HistogramCache, Mutex,
     OnceLock, Ordering, ParentHistogram, PredictorPlan, PropertyColumn, PropertyHistogram,
@@ -291,6 +291,7 @@ pub(super) fn find_best_split_with_properties(
     } else {
         Vec::new()
     };
+    let _sweep_setup_scope = histogram_detail_scope("ma.sweep_setup");
     let compact_limit = if options.dense_histogram == DenseHistogram::Extended {
         4096
     } else {
@@ -322,6 +323,8 @@ pub(super) fn find_best_split_with_properties(
         scorer.lanes(),
         options.sparse_entropy && !options.scoring.fast_entropy,
     );
+    drop(_sweep_setup_scope);
+    let _race_scope = histogram_detail_scope("ma.sweep_race");
     let race = ma_search::race(
         samples,
         indices,
@@ -355,8 +358,10 @@ pub(super) fn find_best_split_with_properties(
             }
         }
     }
+    drop(_race_scope);
     let mut winners = [None; 6];
     let candidates: Vec<Result<(Candidates, bool)>> = {
+        let _dispatch_scope = histogram_detail_scope("ma.sweep_dispatch");
         let cache_stride = working_cache.as_ref().and_then(|cache| cache.stride);
         let collection_stride = histogram_stride(
             parents.iter().map(|p| p.counts.len()).max().unwrap_or(1),
@@ -392,15 +397,22 @@ pub(super) fn find_best_split_with_properties(
                     })
                 });
                 if options.property_dedup {
+                    let mut fused_fill = false;
                     if let Some(histogram) = histogram.as_mut() {
                         if cached_property {
                             histogram.subtract_marginals_values(samples, removed, values)?;
+                        } else if !options.histogram_shards {
+                            ***histogram = PropertyHistogram::collect_marginals_and_predictors(
+                                samples, indices, parents, property, values, &plan, cache_stride,
+                            )?;
+                            fused_fill = true;
                         } else {
                             ***histogram = PropertyHistogram::collect_marginals_values(
                                 samples, indices, property, values,
                             );
                         }
                     } else {
+                        let _marginal_scope = histogram_detail_scope("ma.marginal_collect");
                         collect_property_marginals(
                             samples,
                             indices,
@@ -462,7 +474,7 @@ pub(super) fn find_best_split_with_properties(
                                 collection_stride,
                                 &mut scratch.shards,
                             )?;
-                        } else {
+                        } else if !fused_fill {
                             histogram.collect_predictors_values(
                                 samples,
                                 indices,
@@ -595,8 +607,16 @@ pub(super) fn find_best_split_with_properties(
     };
     // Indexed collection followed by strict ordered reduction preserves ties
     // independently of Rayon completion order. No worker mutates samples.
+    let _reduce_scope = histogram_detail_scope("ma.sweep_reduce");
+    let mut property_mins = Vec::with_capacity(candidates.len());
     for (property, candidates) in candidates.into_iter().enumerate() {
         let (candidates, redundant) = candidates?;
+        let min_cost = candidates
+            .iter()
+            .flatten()
+            .map(|candidate| candidate.cost())
+            .fold(f32::INFINITY, f32::min);
+        property_mins.push((property, min_cost));
         if options.property_dedup {
             working_redundant[property] = u8::from(redundant);
         }
@@ -607,6 +627,45 @@ pub(super) fn find_best_split_with_properties(
         }
     }
     let decision = choose_split(winners, base_bits, options);
+    // Property-level instrument: per-property evaluation/win counts and the
+    // ratio of each property's best candidate to the node's best candidate.
+    // Cheap atomics; only printed through the opt-in profile note.
+    let global_min = winners
+        .iter()
+        .flatten()
+        .map(|candidate| candidate.cost())
+        .fold(f32::INFINITY, f32::min);
+    for &(property, min_cost) in &property_mins {
+        let id = options.properties[property];
+        if id >= 32 {
+            continue;
+        }
+        stats.property_evals[id].fetch_add(1, Ordering::Relaxed);
+        if min_cost.is_finite() && global_min.is_finite() && global_min > 0.0 {
+            let gap = min_cost / global_min;
+            let bucket = if gap <= 1.01 {
+                0
+            } else if gap <= 1.05 {
+                1
+            } else if gap <= 1.2 {
+                2
+            } else {
+                3
+            };
+            stats.property_gap[bucket].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if let Some(split) = &decision {
+        let id = options.properties[split.property];
+        if id < 32 {
+            stats.property_wins[id].fetch_add(1, Ordering::Relaxed);
+            let pred = split.below_predictor;
+            if pred < 14 {
+                stats.property_wins_pred[pred][id].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    drop(_reduce_scope);
     *cache = working_cache;
     *redundant_properties = working_redundant;
     Ok(decision)

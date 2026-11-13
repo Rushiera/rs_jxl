@@ -653,8 +653,8 @@ fn no_edge_rows_match_generic_neighbors_and_exact_source_guards() {
                 );
             }
             let mut actual = Vec::new();
-            let mut pixel = |x, neighbors| {
-                actual.push((x, neighbors));
+            let mut pixel = |x, value, neighbors| {
+                actual.push((x, value, neighbors));
                 Ok(())
             };
             if has_no_edge_interior(width, y, 0) {
@@ -665,8 +665,9 @@ fn no_edge_rows_match_generic_neighbors_and_exact_source_guards() {
                 visit_source_row::<false>(&plane, y, 0..width, &mut pixel).unwrap();
             }
             assert_eq!(actual.len(), width);
-            for (x, &(position, neighbors)) in actual.iter().enumerate() {
+            for (x, &(position, value, neighbors)) in actual.iter().enumerate() {
                 assert_eq!(position, x);
+                assert_eq!(value, plane.samples[y * width + x]);
                 assert_eq!(
                     neighbors,
                     Neighbors::from_plane(&plane.samples, width, width, x, y).unwrap()
