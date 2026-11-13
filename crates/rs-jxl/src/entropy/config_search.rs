@@ -33,6 +33,11 @@
 //! The internal model entry point retains winning histograms, adds lengths, and
 //! passes them directly to table construction. Public config-only APIs remain
 //! unchanged. Not ported: fuzzer modes, final-plan replay and audit hooks.
+//!
+//! Fixed/streaming plans can reuse the model's raw context counts instead of
+//! rescanning every token: those rows were counted with the same configuration
+//! and length reservation, so their largest nonzero index is the exact symbol
+//! maximum the plan needs. Adaptive searches ignore the rows.
 
 use super::ans_histogram::{AnsHistogramStrategy, NormalizedHistogram};
 use super::hybrid_uint::HybridUintConfig;
@@ -548,7 +553,26 @@ fn fixed_config_plan(
     lz77: bool,
     prefix_codes: bool,
     options: &EntropyOptions,
+    precounted: Option<&[Vec<u64>]>,
 ) -> Result<ConfigPlan> {
+    if let Some(counts) = precounted {
+        if counts.len() == num_histograms {
+            return fixed_config_plan_from_counts(
+                counts,
+                num_histograms,
+                lz77,
+                prefix_codes,
+                options,
+            );
+        }
+        crate::profile::note(
+            "entropy.uint_config_search.fixed_scan",
+            format_args!(
+                "precounted_len={} histograms={num_histograms} token_scan=1",
+                counts.len(),
+            ),
+        );
+    }
     let _profile = crate::profile::scope("entropy.uint_config_search.fixed_scan");
     let maximum_log = if prefix_codes {
         PREFIX_LOG_ALPHA_SIZE
@@ -608,6 +632,89 @@ fn fixed_config_plan(
     )
 }
 
+/// Fixed-config plan derived from already-counted histogram rows.
+///
+/// The model counts every raw context before clustering (`raw_histograms`),
+/// using the same `Fixed` config — or `HybridUintConfig::default()` for the
+/// streaming/Fast/Best policies that skip adaptive search. Each row therefore
+/// already stores the encoded symbol of every token, with the LZ77 length
+/// reservation applied, and the largest nonzero index is exactly the maximum
+/// symbol the alphabet logarithm needs. Reusing the rows removes both full
+/// token scans (statistics and literal re-encoding).
+///
+/// Preconditions, all established by the caller: rows come from
+/// `raw_histograms` for the same streams and options, `contexts` matches the
+/// map, and `raw_histograms` accepted every literal below the LZ77
+/// reservation. Nothing here can distinguish a literal symbol from a length
+/// symbol, so it must not be called without that scan.
+fn fixed_config_plan_from_counts(
+    counts: &[Vec<u64>],
+    num_histograms: usize,
+    lz77: bool,
+    prefix_codes: bool,
+    options: &EntropyOptions,
+) -> Result<ConfigPlan> {
+    let _profile = crate::profile::scope("entropy.uint_config_search.fixed_scan");
+    if !(1..=256).contains(&num_histograms) {
+        return Err(Error::InvalidInput(
+            "config search needs 1..=256 histograms".into(),
+        ));
+    }
+    let maximum_log = if prefix_codes {
+        PREFIX_LOG_ALPHA_SIZE
+    } else {
+        options.max_log_alpha_size
+    };
+    let alphabet_size = 1usize << maximum_log;
+    let selected = match options.uint_config {
+        UintConfigStrategy::Fixed(config) => config,
+        _ => HybridUintConfig::default(),
+    };
+    if selected.split_exponent() > u32::from(maximum_log) {
+        return Err(Error::InvalidInput(
+            "fixed uint config exceeds the requested entropy alphabet".into(),
+        ));
+    }
+    let mut max_symbol = 0usize;
+    let mut bins = 0usize;
+    for histogram in counts {
+        let total = histogram
+            .iter()
+            .try_fold(0u64, |total, &count| total.checked_add(count))
+            .ok_or(Error::Limit(
+                "config search histogram weight exceeds i32::MAX",
+            ))?;
+        if total > i32::MAX as u64 {
+            return Err(Error::Limit(
+                "config search histogram weight exceeds i32::MAX",
+            ));
+        }
+        // The reservation split between literals and lengths was enforced while
+        // counting; only the shared alphabet bound remains for this plan.
+        let Some(last) = histogram.iter().rposition(|&count| count != 0) else {
+            continue;
+        };
+        if last >= alphabet_size {
+            return Err(Error::InvalidInput(
+                "uint symbol exceeds its alphabet or LZ77 reservation".into(),
+            ));
+        }
+        max_symbol = max_symbol.max(last);
+        bins += histogram.iter().filter(|&&count| count != 0).count();
+    }
+    crate::profile::note(
+        "entropy.uint_config_search.fixed_scan",
+        format_args!("histograms={num_histograms} bins={bins} precounted=1"),
+    );
+    finish_config_plan(
+        vec![selected; num_histograms],
+        max_symbol,
+        lz77,
+        prefix_codes,
+        options,
+    )
+}
+
 /// Source ChooseUintConfigs policy with configurable ANS bounds. Adaptive
 /// trials ignore lengths for cost, then include them when sizing the alphabet.
 /// Ordinary configs remain per histogram, including the distance histogram.
@@ -656,23 +763,24 @@ fn choose_config_plan_with_workers(
 
 pub(super) struct SearchPlan {
     pub(super) plan: ConfigPlan,
-    /// Adaptive trials already counted literals. Fixed/streaming policies keep
-    /// their non-transposing scan; the caller retains the clustered raw counts.
+    /// Adaptive trials already counted literals. Fixed/streaming policies only
+    /// choose configurations; the caller retains the clustered raw counts.
     pub(super) counts: Option<Vec<Vec<u64>>>,
 }
 
-pub(super) fn choose_config_plan_and_histograms(
+pub(super) fn choose_config_plan_and_histograms_precounted(
     streams: &[Vec<Token>],
     context_map: &[u8],
     num_histograms: usize,
     lz77: bool,
     prefix_codes: bool,
     options: &EntropyOptions,
+    precounted: Option<&[Vec<u64>]>,
 ) -> Result<SearchPlan> {
     let use_workers = !crate::execution::is_serial()
         && rayon::current_thread_index().is_some()
         && crate::execution::worker_count() > 1;
-    search_config_plan_with_workers(
+    search_config_plan_with_workers_precounted(
         streams,
         context_map,
         num_histograms,
@@ -680,6 +788,7 @@ pub(super) fn choose_config_plan_and_histograms(
         prefix_codes,
         options,
         use_workers,
+        precounted,
     )
 }
 
@@ -701,6 +810,30 @@ fn search_config_plan_with_workers(
         options,
         use_workers,
         None,
+        None,
+    )
+}
+
+fn search_config_plan_with_workers_precounted(
+    streams: &[Vec<Token>],
+    context_map: &[u8],
+    num_histograms: usize,
+    lz77: bool,
+    prefix_codes: bool,
+    options: &EntropyOptions,
+    use_workers: bool,
+    precounted: Option<&[Vec<u64>]>,
+) -> Result<SearchPlan> {
+    search_config_plan_with_candidates(
+        streams,
+        context_map,
+        num_histograms,
+        lz77,
+        prefix_codes,
+        options,
+        use_workers,
+        None,
+        precounted,
     )
 }
 
@@ -713,6 +846,7 @@ fn search_config_plan_with_candidates(
     options: &EntropyOptions,
     use_workers: bool,
     candidate_override: Option<&[HybridUintConfig]>,
+    precounted: Option<&[Vec<u64>]>,
 ) -> Result<SearchPlan> {
     let _profile = crate::profile::scope("entropy.uint_config_search");
     crate::profile::note(
@@ -733,6 +867,7 @@ fn search_config_plan_with_candidates(
             lz77,
             prefix_codes,
             options,
+            precounted,
         )
         .map(|plan| SearchPlan { plan, counts: None });
     }
@@ -1077,9 +1212,10 @@ mod tests {
                 ..EntropyOptions::default()
             },
         ] {
-            let search =
-                choose_config_plan_and_histograms(&streams, &[0], 1, false, false, &options)
-                    .unwrap();
+            let search = choose_config_plan_and_histograms_precounted(
+                &streams, &[0], 1, false, false, &options, None,
+            )
+            .unwrap();
             assert!(search.counts.is_none());
             assert_eq!(
                 search.plan,
@@ -1555,6 +1691,101 @@ mod tests {
             configs.push(selected);
         }
         finish_config_plan(configs, max_symbol, lz77, prefix_codes, options)
+    }
+
+    /// Counts rows exactly as `raw_histograms` does for the same streams.
+    fn raw_counts_like_model(
+        streams: &[Vec<Token>],
+        context_map: &[u8],
+        num_histograms: usize,
+        options: &EntropyOptions,
+    ) -> Vec<Vec<u64>> {
+        let selected = match options.uint_config {
+            UintConfigStrategy::Fixed(config) => config,
+            _ => HybridUintConfig::default(),
+        };
+        let mut counts = vec![Vec::new(); num_histograms];
+        for token in streams.iter().flatten() {
+            let config = if token.is_length {
+                options.lz77_length_config
+            } else {
+                selected
+            };
+            let symbol = config.encode(token.value).token as usize
+                + if token.is_length {
+                    options.lz77_min_symbol as usize
+                } else {
+                    0
+                };
+            let histogram = usize::from(context_map[token.context]);
+            if counts[histogram].len() <= symbol {
+                counts[histogram].resize(symbol + 1, 0);
+            }
+            counts[histogram][symbol] += 1;
+        }
+        counts
+    }
+
+    #[test]
+    fn precounted_fixed_plan_matches_token_scan() {
+        let values = [0u32, 1, 7, 15, 16, 47, 48, 223, 224, 255];
+        for lz77 in [false, true] {
+            let mut streams = vec![Vec::new(), Vec::new(), Vec::new()];
+            for (i, &value) in values.iter().enumerate() {
+                // With LZ77, literals must stay below the reserved length
+                // symbol start; raw_histograms enforces that before the plan.
+                if lz77 && value >= 224 {
+                    continue;
+                }
+                streams[i % 3].push(literal(i % 3, value));
+            }
+            if lz77 {
+                streams[1].push(Token {
+                    context: 1,
+                    value: 1 << 20,
+                    is_length: true,
+                });
+            }
+            for map in [[1u8, 0, 2], [0, 0, 1]] {
+                for strategy in [
+                    UintConfigStrategy::Fixed(config(4, 2, 0)),
+                    UintConfigStrategy::Fixed(config(0, 0, 0)),
+                    UintConfigStrategy::Fixed(config(5, 1, 1)),
+                    UintConfigStrategy::Fixed(config(8, 0, 0)),
+                    UintConfigStrategy::Fast,
+                ] {
+                    for streaming_mode in [false, true] {
+                        for prefix in [false, true] {
+                            let options = EntropyOptions {
+                                uint_config: strategy,
+                                streaming_mode,
+                                lz77_length_config: config(0, 0, 0),
+                                ..EntropyOptions::default()
+                            };
+                            let counts = raw_counts_like_model(&streams, &map, 3, &options);
+                            let expected =
+                                choose_config_plan(&streams, &map, 3, lz77, prefix, &options)
+                                    .map_err(|error| format!("{error:?}"));
+                            let actual = choose_config_plan_and_histograms_precounted(
+                                &streams,
+                                &map,
+                                3,
+                                lz77,
+                                prefix,
+                                &options,
+                                Some(&counts),
+                            )
+                            .map(|search| search.plan)
+                            .map_err(|error| format!("{error:?}"));
+                            assert_eq!(
+                                actual, expected,
+                                "lz77={lz77} map={map:?} strategy={strategy:?} streaming={streaming_mode} prefix={prefix}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

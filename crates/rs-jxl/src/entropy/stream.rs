@@ -8,7 +8,7 @@ use std::ops::Range;
 use super::ans::{AnsCode, AnsToken, write_mapped_tokens};
 #[cfg(test)]
 use super::config_search::choose_config_plan;
-use super::config_search::choose_config_plan_and_histograms;
+use super::config_search::choose_config_plan_and_histograms_precounted;
 use super::options::{ClusterStrategy, EntropyOptions, PREFIX_LOG_ALPHA_SIZE, UintConfigStrategy};
 use super::{hybrid_uint::HybridUintConfig, prefix_code::PrefixCode};
 use crate::{Error, Result, bit_writer::BitWriter};
@@ -410,13 +410,14 @@ impl Model {
         options: &EntropyOptions,
     ) -> Result<Self> {
         let num_histograms = clustered.len();
-        let search = choose_config_plan_and_histograms(
+        let search = choose_config_plan_and_histograms_precounted(
             streams,
             &map,
             num_histograms,
             lz77,
             prefix,
             options,
+            Some(&clustered),
         )?;
         Self::from_search(clustered, map, lz77, prefix, options, search)
     }
@@ -685,14 +686,16 @@ impl Model {
             options.clustering,
             prefix && options.prefix_singleton_guard,
         )?;
-        let plan = super::config_search::choose_config_plan(
+        let plan = super::config_search::choose_config_plan_and_histograms_precounted(
             streams,
             &map,
             clustered.len(),
             lz77,
             prefix,
             options,
-        )?;
+            Some(&clustered),
+        )?
+        .plan;
         if plan.log_alpha_size != self.log_alpha_size
             || &plan.configs[..old_count] != self.configs.as_slice()
         {

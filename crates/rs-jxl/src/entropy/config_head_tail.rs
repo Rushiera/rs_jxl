@@ -91,6 +91,7 @@ pub(crate) fn search(
         options,
         workers,
         Some(&candidates),
+        None,
     )
     .map(|plan| (plan, candidates.len()))
 }
